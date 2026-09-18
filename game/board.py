@@ -1,11 +1,13 @@
-"""棋盘类 - 玻璃果冻质感面板"""
+"""棋盘类 - 深蓝金属面板（底图超采样缓存）"""
 import pygame
 from game.settings import (
     BOARD_ROWS, BOARD_COLS, CELL_SIZE, BOARD_PADDING,
-    OUTLINE, PANEL, PANEL_SHADE, CELL_A, CELL_B,
+    PANEL, PANEL_SHADE, METAL_RIM, CELL_A, CELL_B, GRID_LINE_COLOR,
     DIR_UP, DIR_DOWN, DIR_LEFT, DIR_RIGHT
 )
 from game.arrow import Arrow
+
+SS = 2
 
 
 class Board:
@@ -15,6 +17,47 @@ class Board:
         self.rows = rows
         self.cols = cols
         self.arrows = []
+        self._frame = self._build_frame()
+
+    def _build_frame(self):
+        """构建 2x 超采样的静态棋盘底图（包边+钢面板+棋盘格+网格），缩回 1x 缓存"""
+        bw = self.cols * CELL_SIZE
+        bh = self.rows * CELL_SIZE
+        frame = 12
+        fw, fh = bw + frame * 2, bh + frame * 2
+        pw, ph = fw + 8, fh + 9
+
+        big = pygame.Surface((pw * SS, ph * SS), pygame.SRCALPHA)
+        r = 20 * SS
+        fr = 16 * SS
+        # 投影 + 银色金属包边 + 钢蓝面板
+        pygame.draw.rect(big, (6, 12, 24, 120), (8, 14, fw * SS, fh * SS), border_radius=r)
+        pygame.draw.rect(big, METAL_RIM, (0, 0, fw * SS, fh * SS), border_radius=r)
+        pygame.draw.rect(big, PANEL, (6, 6, (fw - 6) * SS, (fh - 6) * SS), border_radius=fr)
+        pygame.draw.line(big, (214, 226, 244, 130), (32, 12), (fw * SS - 32, 12), 4)
+
+        # 棋盘格（表面内偏移 = frame+4 = 16）
+        ox = (frame + 4) * SS
+        for row in range(self.rows):
+            for col in range(self.cols):
+                color = CELL_A if (row + col) % 2 == 0 else CELL_B
+                pygame.draw.rect(big, color,
+                                 (ox + col * CELL_SIZE * SS, ox + row * CELL_SIZE * SS,
+                                  CELL_SIZE * SS, CELL_SIZE * SS))
+
+        # 内嵌边框遮罩环（盖住格子直角）；表面内偏移 (7,6)
+        pygame.draw.rect(big, PANEL, (14, 12, (fw - 6) * SS, (fh - 6) * SS),
+                         width=(frame - 2) * SS, border_radius=fr)
+
+        # 细网格线（2x 下 2px，缩回后为柔细 1px）
+        for i in range(1, self.rows):
+            y = ox + i * CELL_SIZE * SS
+            pygame.draw.line(big, GRID_LINE_COLOR, (ox, y), (ox + bw * SS, y), 2)
+        for i in range(1, self.cols):
+            x = ox + i * CELL_SIZE * SS
+            pygame.draw.line(big, GRID_LINE_COLOR, (x, ox), (x, ox + bh * SS), 2)
+
+        return pygame.transform.smoothscale(big, (pw, ph))
 
     def load_level(self, level_data):
         """加载关卡数据，每个元素为 (row, col, direction)"""
@@ -69,35 +112,9 @@ class Board:
             arrow.update(dt)
 
     def draw(self, surface, board_x, board_y):
-        """绘制玻璃果冻质感棋盘"""
-        bw = self.cols * CELL_SIZE
-        bh = self.rows * CELL_SIZE
-        frame = 12  # 面板内边距
-
-        fx, fy = board_x - frame, board_y - frame
-        fw, fh = bw + frame * 2, bh + frame * 2
-        r = 24
-
-        # 面板离屏绘制（柔和投影 + 统一描边 + 果冻白面板）
-        tmp = pygame.Surface((fw + 8, fh + 10), pygame.SRCALPHA)
-        pygame.draw.rect(tmp, (60, 52, 45, 55), (4, 8, fw, fh), border_radius=r)
-        pygame.draw.rect(tmp, OUTLINE, (0, 0, fw, fh), border_radius=r)
-        fr = r - 5
-        pygame.draw.rect(tmp, PANEL, (4, 4, fw - 8, fh - 8), border_radius=fr)
-        surface.blit(tmp, (fx - 4, fy - 4))
-
-        # 同色系双色棋盘格
-        for row in range(self.rows):
-            for col in range(self.cols):
-                color = CELL_A if (row + col) % 2 == 0 else CELL_B
-                pygame.draw.rect(surface, color,
-                                 (board_x + col * CELL_SIZE, board_y + row * CELL_SIZE, CELL_SIZE, CELL_SIZE))
-
-        # 圆角遮罩环：盖住格子直角，让棋盘格区域保持圆润
-        pygame.draw.rect(surface, PANEL, (fx + 4, fy + 4, fw - 8, fh - 8),
-                         width=frame - 2, border_radius=fr)
-
-        # 绘制所有箭头
+        """贴静态超采样底图 + 动态箭头"""
+        frame = 12
+        surface.blit(self._frame, (board_x - frame - 4, board_y - frame - 3))
         for arrow in self.arrows:
             arrow.draw(surface, board_x, board_y)
 

@@ -5,18 +5,19 @@ import os
 import time
 import math
 from game.settings import (
-    SCREEN_WIDTH, SCREEN_HEIGHT, WHITE, BLACK, DARK, DARK2, MEDIUM, GRAY, LIGHT_GRAY, LIGHT,
-    OUTLINE, BG_TOP, BG_BOT, PANEL, PANEL_SHADE, WOOD_DARK, WOOD_LIGHT, WOOD_BORDER,
+    SCREEN_WIDTH, SCREEN_HEIGHT, WHITE, BLACK, DARK, DARK2, MEDIUM, GRAY, LIGHT_GRAY, LIGHT, INK,
+    OUTLINE, BG_TOP, BG_BOT, PANEL, PANEL_SHADE, SLATE, WOOD_DARK, WOOD_LIGHT, WOOD_BORDER,
     PLANK_BLUE, PLANK_BLUE_DARK, PLANK_GREEN, PLANK_GREEN_DARK,
     PLANK_ORANGE, PLANK_ORANGE_DARK, PLANK_RED, PLANK_RED_DARK, PLANK_PURPLE, PLANK_PURPLE_DARK,
     STAR_GOLD, STAR_EMPTY, MAX_MISTAKES, BOARD_ROWS, BOARD_COLS, CELL_SIZE,
     STATE_START, STATE_LEVEL_SELECT, STATE_PLAYING, STATE_WIN, STATE_LOSE, STATE_ALL_CLEAR, STATE_LOAD_PROMPT,
     get_font_path, SAVE_FILE, SCORE_ANIM_DURATION,
     ARROW_UP_COLOR, ARROW_DOWN_COLOR, ARROW_LEFT_COLOR, ARROW_RIGHT_COLOR,
+    MYSTERY_LEVEL, MYSTERY_HINTS, NORMAL_HINTS,
 )
 from game.board import Board
 from game.arrow import draw_rounded_arrow
-from game.levels import get_level_copy, get_level_count
+from game.levels import get_level_copy, get_level_count, generate_mystery_level
 
 
 # ============ 卡通绘制工具 ============
@@ -50,34 +51,86 @@ def draw_text_outline(surface, text, font, color, center, outline=OUTLINE, width
     surface.blit(surf, surf.get_rect(center=center))
 
 
+SS = 2  # 超采样倍数（SSAA，消除几何边缘锯齿）
+_PLANK_CACHE = {}
+
+
 def make_plank(w, h, base, dark, light, border):
-    """玻璃果冻质感面板：柔和投影+统一描边+底部内影+顶部高光带"""
-    surf = pygame.Surface((w + 6, h + 8), pygame.SRCALPHA)
-    r = max(12, min(20, h // 3))
-    # 柔和投影
-    pygame.draw.rect(surf, (60, 52, 45, 55), (3, 7, w, h), border_radius=r)
-    # 统一卡通描边
-    pygame.draw.rect(surf, border, (0, 0, w, h), border_radius=r)
-    # 果冻主体 + 底部内影（体积感）
-    fr = max(7, r - 5)
-    pygame.draw.rect(surf, base, (3, 3, w - 6, h - 6), border_radius=fr)
-    pygame.draw.rect(surf, (*dark, 70), (3, 3 + (h - 6) // 2, w - 6, (h - 6) // 2), border_radius=fr)
-    # 顶部玻璃高光带
-    hl = max(6, h // 4)
-    pygame.draw.rect(surf, (255, 255, 255, 105), (9, 7, w - 18, hl), border_radius=max(4, hl // 2))
+    """金属质感面板（2x 超采样后平滑缩回，边缘细腻；同参数结果缓存）"""
+    key = (int(w), int(h), tuple(base), tuple(dark), tuple(light), tuple(border))
+    cached = _PLANK_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    pw, ph = w + 8, h + 9
+    big = pygame.Surface((pw * SS, ph * SS), pygame.SRCALPHA)
+    r = max(10, min(16, h // 3)) * SS
+    # 利落深色投影
+    pygame.draw.rect(big, (6, 12, 24, 110), (8, 14, w * SS, h * SS), border_radius=r)
+    # 金属包边
+    pygame.draw.rect(big, border, (0, 0, w * SS, h * SS), border_radius=r)
+
+    # 金属面：垂直微渐变（顶部略亮），用圆角 alpha mask 裁切
+    fr = max(6, min(16, h // 3) - 4) * SS
+    bw2, bh2 = (w - 6) * SS, (h - 6) * SS
+    body = pygame.Surface((bw2, bh2), pygame.SRCALPHA)
+    top_col = tuple(min(255, c + 16) for c in base)
+    for yy in range(bh2):
+        body.fill(lerp_color(top_col, base, (yy / bh2) * 0.7), (0, yy, bw2, 1))
+    mask = pygame.Surface((bw2, bh2), pygame.SRCALPHA)
+    pygame.draw.rect(mask, (255, 255, 255, 255), (0, 0, bw2, bh2), border_radius=fr)
+    body.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+    big.blit(body, (6, 6))
+
+    # 底部斜面暗部（薄而利落的金属收边）
+    band_h = max(5, (h - 6) // 4) * SS
+    pygame.draw.rect(big, (*dark, 46), (12, h * SS - 6 - band_h, w * SS - 24, band_h),
+                     border_top_left_radius=0, border_top_right_radius=0,
+                     border_bottom_left_radius=max(0, fr - 6),
+                     border_bottom_right_radius=max(0, fr - 6))
+    # 顶部高光棱线 / 底部内反光线（2x 下线宽更顺滑）
+    pygame.draw.line(big, (*light, 160), (24, 12), (w * SS - 24, 12), 3)
+    pygame.draw.line(big, (*light, 50), (24, h * SS - 12), (w * SS - 24, h * SS - 12), 2)
+
+    surf = pygame.transform.smoothscale(big, (pw, ph))
+    _PLANK_CACHE[key] = surf
     return surf
 
 
-def draw_plank_button(surface, rect, base, dark, light, border, text="", font=None, text_color=WHITE):
-    """绘制果冻按钮并返回（视觉稍微大于点击区，点击区以 rect 为准）"""
+def draw_heart(surface, cx, cy, size, color):
+    """程序化红心（经典心形参数方程，2x 超采样 + 高光点）"""
+    S = SS
+    box = int(size * 2 + 6)
+    big = pygame.Surface((box * S, box * S), pygame.SRCALPHA)
+    bc = box * S // 2
+    k = (size / 17.0) * S
+    pts = []
+    for i in range(60):
+        t = 2 * math.pi * i / 60
+        x = 16 * math.sin(t) ** 3
+        y = -(13 * math.cos(t) - 5 * math.cos(2 * t) - 2 * math.cos(3 * t) - math.cos(4 * t))
+        pts.append((bc + x * k, bc + (y - 2) * k))
+    pygame.draw.polygon(big, color, pts)
+    # 柔和高光
+    hl = tuple(int(c + (255 - c) * 0.55) for c in color)
+    pygame.draw.circle(big, hl, (int(bc - 5 * k), int(bc - 6 * k)), max(2, int(size * 0.22 * S)))
+    small = pygame.transform.smoothscale(big, (box, box))
+    surface.blit(small, (int(cx - box // 2), int(cy - box // 2)))
+
+
+def draw_plank_button(surface, rect, base, dark, light, border, text="", font=None, text_color=None):
+    """绘制金属按钮（文字颜色未指定时按金属面明度自动选择）"""
     surf = make_plank(rect.w, rect.h, base, dark, light, border)
-    surface.blit(surf, (rect.x - 3, rect.y - 3))
+    surface.blit(surf, (rect.x - 4, rect.y - 3))
     if text and font:
+        if text_color is None:
+            lum = base[0] * 0.299 + base[1] * 0.587 + base[2] * 0.114
+            text_color = INK if lum > 150 else WHITE
         draw_text_outline(surface, text, font, text_color, rect.center)
 
 
-def mini_arrow(surface, cx, cy, size, color, direction, outline=(74, 62, 52)):
-    """装饰用小箭头（圆润厚描边）"""
+def mini_arrow(surface, cx, cy, size, color, direction, outline=(50, 64, 90)):
+    """装饰用金属小箭头"""
     draw_rounded_arrow(surface, cx, cy, size, color, direction, outline=outline)
 
 
@@ -88,7 +141,11 @@ class Game:
 
     def __init__(self):
         pygame.init()
-        self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+        try:
+            # SCALED：内部逻辑分辨率不变，GPU 线性缩放到窗口物理像素，高清屏更细腻
+            self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SCALED, vsync=1)
+        except Exception:
+            self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
         pygame.display.set_caption("一箭又一箭")
         self.clock = pygame.time.Clock()
 
@@ -129,6 +186,11 @@ class Game:
         self.shake_time = 0.0
         self.heart_flash = 0.0
         self.float_texts = []
+
+        # 神秘关卡与提示
+        self.is_mystery = False
+        self.hints_left = 0
+        self.hint_arrow = None
 
     # ---------- 背景 ----------
 
@@ -244,7 +306,17 @@ class Game:
                     self.handle_click(event.pos)
             self.update(dt)
             self.draw()
+        # 退出即清空存档：每次启动都从头开始
+        self.clear_save_on_exit()
         pygame.quit()
+
+    def clear_save_on_exit(self):
+        try:
+            if os.path.exists(SAVE_FILE):
+                os.remove(SAVE_FILE)
+        except Exception as e:
+            print(f"清空存档失败: {e}")
+        self.save_data = {'current_level': 0, 'level_states': {}, 'high_scores': {}, 'stars': {}}
 
     def save_state(self):
         if self.undo_available:
@@ -266,6 +338,20 @@ class Game:
             self.level_time = self.undo_history['level_time']
             self.undo_available = False
             self.undo_history = None
+            self.hint_arrow = None
+
+    def use_hint(self):
+        """提示：找到第一个当前可以飞出的箭头并高亮（次数有限）"""
+        if self.state != STATE_PLAYING or self.hints_left <= 0:
+            return
+        for arrow in self.board.arrows:
+            if arrow.alive and self.board.check_path_clear(arrow):
+                for other in self.board.arrows:
+                    other.clear_hint()
+                arrow.start_hint()
+                self.hint_arrow = arrow
+                self.hints_left -= 1
+                return
 
     def handle_click(self, pos):
         x, y = pos
@@ -284,7 +370,8 @@ class Game:
                         self.load_level()
                     return
             if "mystery" in self.buttons and self.buttons["mystery"].collidepoint(x, y):
-                pass
+                self.start_mystery()
+                return
             if "back" in self.buttons and self.buttons["back"].collidepoint(x, y):
                 self.state = STATE_START
 
@@ -306,8 +393,12 @@ class Game:
             if "undo" in self.buttons and self.buttons["undo"].collidepoint(x, y) and self.undo_available and self.undo_history:
                 self.undo()
                 return
+            if "hint" in self.buttons and self.buttons["hint"].collidepoint(x, y):
+                self.use_hint()
+                return
             if "back_to_menu" in self.buttons and self.buttons["back_to_menu"].collidepoint(x, y):
-                self.save_level_state()
+                if not self.is_mystery:
+                    self.save_level_state()
                 self.state = STATE_LEVEL_SELECT
                 return
             arrow = self.board.get_arrow_at(x, y, self.board_x, self.board_y)
@@ -315,10 +406,16 @@ class Game:
                 self.try_remove_arrow(arrow)
 
         elif self.state == STATE_WIN:
-            for key, action in [("next", self.next_level), ("restart_win", self.restart_level),
-                                ("menu_win", lambda: setattr(self, 'state', STATE_LEVEL_SELECT))]:
-                if key in self.buttons and self.buttons[key].collidepoint(x, y):
-                    action()
+            if self.is_mystery:
+                if "mystery_again" in self.buttons and self.buttons["mystery_again"].collidepoint(x, y):
+                    self.start_mystery()
+                elif "menu_win" in self.buttons and self.buttons["menu_win"].collidepoint(x, y):
+                    self.state = STATE_LEVEL_SELECT
+            else:
+                for key, action in [("next", self.next_level), ("restart_win", self.restart_level),
+                                    ("menu_win", lambda: setattr(self, 'state', STATE_LEVEL_SELECT))]:
+                    if key in self.buttons and self.buttons[key].collidepoint(x, y):
+                        action()
 
         elif self.state == STATE_LOSE:
             for key, action in [("restart_lose", self.restart_level),
@@ -333,18 +430,38 @@ class Game:
     def load_level(self):
         level_data = get_level_copy(self.current_level)
         if level_data:
+            self.is_mystery = False
             self.board.load_level(level_data)
             self.mistakes_left = MAX_MISTAKES
             self.undo_available = True
             self.undo_history = None
             self.level_start_time = time.time()
             self.level_time = 0
+            self.hints_left = NORMAL_HINTS
+            self.hint_arrow = None
             self.state = STATE_PLAYING
         else:
             self.state = STATE_ALL_CLEAR
 
+    def start_mystery(self):
+        """开始神秘关卡：随机生成一局全新的 5x5 关卡"""
+        self.current_level = MYSTERY_LEVEL
+        self.is_mystery = True
+        self.board.load_level(generate_mystery_level())
+        self.mistakes_left = MAX_MISTAKES
+        self.undo_available = True
+        self.undo_history = None
+        self.level_start_time = time.time()
+        self.level_time = 0
+        self.hints_left = MYSTERY_HINTS
+        self.hint_arrow = None
+        self.state = STATE_PLAYING
+
     def restart_level(self):
-        self.load_level()
+        if self.is_mystery:
+            self.start_mystery()
+        else:
+            self.load_level()
 
     def next_level(self):
         self.current_level += 1
@@ -369,7 +486,7 @@ class Game:
             ax = self.board_x + arrow.col * CELL_SIZE + CELL_SIZE // 2
             ay = self.board_y + arrow.row * CELL_SIZE - 12
             self.float_texts.append({'text': "挡住了！", 'x': ax, 'y': ay,
-                                     'born': time.time(), 'color': (232, 76, 66)})
+                                     'born': time.time(), 'color': (255, 110, 110)})
             if self.mistakes_left <= 0:
                 self.state = STATE_LOSE
 
@@ -386,20 +503,24 @@ class Game:
             self.board.update(dt)
             self.level_time = time.time() - self.level_start_time
             if self.board.is_cleared():
-                self.calculate_score()
-                self.update_high_score(self.current_level, self.score)
-                self.save_level_stars(self.current_level, self.stars)
-                level_key = f"level_{self.current_level}"
-                if level_key in self.save_data.get('level_states', {}):
-                    del self.save_data['level_states'][level_key]
-                    self.save_to_file()
-                if self.current_level + 1 < get_level_count():
+                if self.is_mystery:
+                    # 神秘关卡：无星级、无分数
                     self.state = STATE_WIN
                 else:
-                    self.state = STATE_ALL_CLEAR
-                self.score_animating = True
-                self.score_anim_start = time.time()
-                self.score_display = 0
+                    self.calculate_score()
+                    self.update_high_score(self.current_level, self.score)
+                    self.save_level_stars(self.current_level, self.stars)
+                    level_key = f"level_{self.current_level}"
+                    if level_key in self.save_data.get('level_states', {}):
+                        del self.save_data['level_states'][level_key]
+                        self.save_to_file()
+                    if self.current_level + 1 < get_level_count():
+                        self.state = STATE_WIN
+                    else:
+                        self.state = STATE_ALL_CLEAR
+                    self.score_animating = True
+                    self.score_anim_start = time.time()
+                    self.score_display = 0
         if self.score_animating:
             elapsed = time.time() - self.score_anim_start
             progress = min(elapsed / SCORE_ANIM_DURATION, 1.0)
@@ -517,7 +638,7 @@ class Game:
         self.screen.blit(overlay, (0, 0))
 
         panel = pygame.Rect(SCREEN_WIDTH // 2 - 215, SCREEN_HEIGHT // 2 - 145, 430, 290)
-        draw_plank_button(self.screen, panel, WOOD_LIGHT, WOOD_DARK, WHITE, WOOD_BORDER)
+        draw_plank_button(self.screen, panel, PANEL, PANEL_SHADE, WHITE, WOOD_BORDER)
 
         draw_text_outline(self.screen, f"发现关卡 {self.current_level + 1} 的存档",
                           self.font_medium, DARK, (panel.centerx, panel.y + 62), width=2)
@@ -546,18 +667,20 @@ class Game:
                           "菜单", self.font_small)
         self.buttons["back_to_menu"] = back
 
-        draw_text_outline(self.screen, f"关卡 {self.current_level + 1}", self.font_small,
+        level_label = "神秘关卡" if self.is_mystery else f"关卡 {self.current_level + 1}"
+        draw_text_outline(self.screen, level_label, self.font_small,
                           DARK, (135, 34))
         draw_text_outline(self.screen, f"剩余 {self.board.get_remaining_count()}",
                           self.font_small, DARK, (SCREEN_WIDTH // 2 - 90, 34))
         draw_text_outline(self.screen, f"时间 {int(self.level_time)}s", self.font_small,
                           DARK, (SCREEN_WIDTH // 2 + 60, 34))
-        hearts = "♥" * max(0, self.mistakes_left)
         hcol = (240, 92, 84)
         if self.heart_flash > 0 and int(self.heart_flash * 10) % 2 == 0:
             hcol = (130, 32, 28)
-        draw_text_outline(self.screen, hearts, self.font_medium, hcol,
-                          (SCREEN_WIDTH - 90, 33))
+        n = max(0, self.mistakes_left)
+        hx0 = SCREEN_WIDTH - 118
+        for i in range(n):
+            draw_heart(self.screen, hx0 + i * 26, 34, 11, hcol)
 
         # 棋盘（受撞击时震动）
         dx = dy = 0
@@ -567,22 +690,32 @@ class Game:
             dy = int(amp * 0.6 * math.cos(self.shake_time * 47))
         self.board.draw(self.screen, self.board_x + dx, self.board_y + dy)
 
-        # 底部按钮
+        # 底部按钮（重新开始 / 撤销 / 提示）
         by = self.board_y + BOARD_ROWS * CELL_SIZE + 24
-        bw, bh = 150, 54
-        restart = pygame.Rect(SCREEN_WIDTH // 2 - bw - 18, by, bw, bh)
+        bw, bh, gap = 130, 54, 14
+        sx = (SCREEN_WIDTH - (bw * 3 + gap * 2)) // 2
+        restart = pygame.Rect(sx, by, bw, bh)
         draw_plank_button(self.screen, restart, PLANK_BLUE, PLANK_BLUE_DARK, WHITE, OUTLINE,
                           "重新开始", self.font_small)
         self.buttons["restart"] = restart
 
-        undo = pygame.Rect(SCREEN_WIDTH // 2 + 18, by, bw, bh)
+        undo = pygame.Rect(sx + bw + gap, by, bw, bh)
         if self.undo_available and self.undo_history:
             draw_plank_button(self.screen, undo, PLANK_ORANGE, PLANK_ORANGE_DARK, WHITE, OUTLINE,
                               "撤销 (1次)", self.font_small)
         else:
-            draw_plank_button(self.screen, undo, (204, 212, 198), (168, 178, 162), WHITE, OUTLINE,
-                              "撤销 (1次)", self.font_small, MEDIUM)
+            draw_plank_button(self.screen, undo, (150, 160, 180), (106, 118, 140), WHITE, WOOD_BORDER,
+                              "撤销 (1次)", self.font_small, GRAY)
         self.buttons["undo"] = undo
+
+        hint_btn = pygame.Rect(sx + (bw + gap) * 2, by, bw, bh)
+        if self.hints_left > 0:
+            draw_plank_button(self.screen, hint_btn, SLATE, OUTLINE, WHITE, OUTLINE,
+                              f"提示 ({self.hints_left})", self.font_small)
+        else:
+            draw_plank_button(self.screen, hint_btn, (150, 160, 180), (106, 118, 140), WHITE, WOOD_BORDER,
+                              f"提示 (0)", self.font_small, GRAY)
+        self.buttons["hint"] = hint_btn
 
         # 上浮渐隐的错误提示
         self._draw_float_texts()
@@ -606,9 +739,12 @@ class Game:
         self.screen.blit(overlay, (0, 0))
 
     def draw_win_overlay(self):
+        if self.is_mystery:
+            self.draw_mystery_win_overlay()
+            return
         self._dim(150)
         panel = pygame.Rect(SCREEN_WIDTH // 2 - 210, 55, 420, 520)
-        draw_plank_button(self.screen, panel, WOOD_LIGHT, WOOD_DARK, WHITE, WOOD_BORDER)
+        draw_plank_button(self.screen, panel, PANEL, PANEL_SHADE, WHITE, WOOD_BORDER)
 
         # 标题绿木板
         t = pygame.Rect(SCREEN_WIDTH // 2 - 150, 82, 300, 66)
@@ -652,10 +788,36 @@ class Game:
                           "返回菜单", self.font_medium, DARK)
         self.buttons["menu_win"] = menu
 
+    def draw_mystery_win_overlay(self):
+        """神秘关卡胜利面板：无星级、无分数"""
+        self._dim(150)
+        panel = pygame.Rect(SCREEN_WIDTH // 2 - 210, 130, 420, 320)
+        draw_plank_button(self.screen, panel, PANEL, PANEL_SHADE, WHITE, WOOD_BORDER)
+
+        t = pygame.Rect(SCREEN_WIDTH // 2 - 150, 158, 300, 66)
+        draw_plank_button(self.screen, t, PLANK_GREEN, PLANK_GREEN_DARK, WOOD_LIGHT, WOOD_BORDER)
+        draw_text_outline(self.screen, "挑战成功!", self.font_large, WHITE,
+                          (t.centerx, t.centery), width=3)
+
+        draw_text_outline(self.screen, "全部箭头都成功飞出了棋盘", self.font_small,
+                          DARK2, (SCREEN_WIDTH // 2, 272))
+
+        bw, bh = 220, 54
+        bx = SCREEN_WIDTH // 2 - bw // 2
+        again = pygame.Rect(bx, 308, bw, bh)
+        draw_plank_button(self.screen, again, PLANK_GREEN, PLANK_GREEN_DARK, WOOD_LIGHT, WOOD_BORDER,
+                          "再来一局", self.font_medium)
+        self.buttons["mystery_again"] = again
+
+        menu = pygame.Rect(bx, 378, bw, bh)
+        draw_plank_button(self.screen, menu, PANEL, PANEL_SHADE, WHITE, OUTLINE,
+                          "返回菜单", self.font_medium, DARK)
+        self.buttons["menu_win"] = menu
+
     def draw_lose_overlay(self):
         self._dim(150)
         panel = pygame.Rect(SCREEN_WIDTH // 2 - 210, 160, 420, 300)
-        draw_plank_button(self.screen, panel, WOOD_LIGHT, WOOD_DARK, WHITE, WOOD_BORDER)
+        draw_plank_button(self.screen, panel, PANEL, PANEL_SHADE, WHITE, WOOD_BORDER)
 
         t = pygame.Rect(SCREEN_WIDTH // 2 - 150, 192, 300, 66)
         draw_plank_button(self.screen, t, PLANK_RED, PLANK_RED_DARK, WOOD_LIGHT, WOOD_BORDER)
@@ -678,7 +840,7 @@ class Game:
 
     def draw_all_clear_screen(self):
         panel = pygame.Rect(SCREEN_WIDTH // 2 - 215, SCREEN_HEIGHT // 2 - 170, 430, 340)
-        draw_plank_button(self.screen, panel, WOOD_LIGHT, WOOD_DARK, WHITE, WOOD_BORDER)
+        draw_plank_button(self.screen, panel, PANEL, PANEL_SHADE, WHITE, WOOD_BORDER)
 
         t = pygame.Rect(SCREEN_WIDTH // 2 - 160, panel.y + 30, 320, 70)
         draw_plank_button(self.screen, t, PLANK_GREEN, PLANK_GREEN_DARK, WOOD_LIGHT, WOOD_BORDER)
@@ -697,18 +859,24 @@ class Game:
         self.buttons["menu"] = btn
 
     def draw_star(self, cx, cy, radius, color, filled=True, shine=False):
-        """五角星：实心填充+统一描边（金色带高光点）"""
+        """五角星（2x 超采样离屏绘制，边缘细腻）"""
+        S = SS
+        box = radius * 2 + 8
+        big = pygame.Surface((box * S, box * S), pygame.SRCALPHA)
+        bc = box * S // 2
         pts = []
         for i in range(10):
             ang = math.pi / 2 + i * math.pi / 5
-            r = radius if i % 2 == 0 else radius * 0.42
-            pts.append((cx + r * math.cos(ang), cy - r * math.sin(ang)))
+            rr = radius * S if i % 2 == 0 else radius * 0.42 * S
+            pts.append((bc + rr * math.cos(ang), bc - rr * math.sin(ang)))
         if filled:
-            pygame.draw.polygon(self.screen, color, pts)
-            pygame.draw.polygon(self.screen, OUTLINE, pts, 2)
+            pygame.draw.polygon(big, color, pts)
+            pygame.draw.polygon(big, OUTLINE, pts, 2 * S)
             if shine and color == STAR_GOLD:
-                pygame.draw.circle(self.screen, WHITE,
-                                   (int(cx - radius * 0.28), int(cy - radius * 0.32)),
-                                   max(2, int(radius * 0.2)))
+                pygame.draw.circle(big, (255, 244, 200),
+                                   (int(bc - radius * 0.28 * S), int(bc - radius * 0.32 * S)),
+                                   max(2, int(radius * 0.2 * S)))
         else:
-            pygame.draw.polygon(self.screen, color, pts, 2)
+            pygame.draw.polygon(big, color, pts, 2 * S)
+        small = pygame.transform.smoothscale(big, (box, box))
+        self.screen.blit(small, (int(cx - box // 2), int(cy - box // 2)))
