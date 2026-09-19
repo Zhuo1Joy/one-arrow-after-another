@@ -1,23 +1,24 @@
-"""箭头类 - 圆润厚描边卡通风格"""
+"""箭头类 - 人字形（chevron）扁平箭头"""
 import pygame
 import math
 from game.settings import (
     ARROW_SIZE, CELL_SIZE,
     ARROW_UP_COLOR, ARROW_DOWN_COLOR, ARROW_LEFT_COLOR, ARROW_RIGHT_COLOR,
+    ARROW_OUTLINE_COLOR,
     DIR_UP, DIR_DOWN, DIR_LEFT, DIR_RIGHT,
     FLY_DURATION, BOUNCE_DURATION, BOUNCE_DISTANCE, BOUNCE_RETURN
 )
 
-# 金属描边色（深钢蓝）
-ARROW_OUTLINE = (50, 64, 90)
+# 描边色（随主题切换）
+ARROW_OUTLINE = ARROW_OUTLINE_COLOR
 
 SS = 2  # 超采样倍数
 _ARROW_CACHE = {}
 
 
 def _arrow_raw_points(direction):
-    """经典粗箭头造型（平尾+三角头，无深缺口），由向右基准形旋转/镜像得到"""
-    base = [(1, 0), (0.02, -0.6), (-0.62, -0.6), (-0.62, 0.6), (0.02, 0.6)]
+    """人字形（chevron，4 顶点）：尖 + 双翅 + 浅 V 口，由向右基准形旋转/镜像得到"""
+    base = [(1.0, 0.0), (-1.0, -0.65), (-0.72, 0.0), (-1.0, 0.65)]
     if direction == DIR_RIGHT:
         return base
     if direction == DIR_LEFT:
@@ -27,53 +28,23 @@ def _arrow_raw_points(direction):
     return [(-y, x) for x, y in base]  # down
 
 
-def _rounded_poly(surface, pts, color, joint_r):
-    """带圆角顶点的实心多边形"""
-    if len(pts) >= 3:
-        pygame.draw.polygon(surface, color, pts)
-    for p in pts:
-        pygame.draw.circle(surface, color, (int(p[0]), int(p[1])), joint_r)
-
-
 def draw_rounded_arrow(surface, cx, cy, size, color, direction, outline=ARROW_OUTLINE, alpha=255):
-    """金属箭头：2x 超采样离屏绘制后平滑缩回（边缘无锯齿），表面按参数缓存"""
+    """扁平三角箭头：2x 超采样后平滑缩回，纯色填充 + 黑色描边，表面按参数缓存"""
     size = max(8, int(size))
     a_key = 255 if alpha >= 252 else max(0, int(alpha)) // 16 * 16
     key = (size, tuple(color), direction, tuple(outline), a_key)
     img = _ARROW_CACHE.get(key)
     if img is None:
-        half = size + 12
+        half = size + 8
         box1 = half * 2
         big = pygame.Surface((box1 * SS, box1 * SS), pygame.SRCALPHA)
         bc = box1 * SS // 2
         s2 = size * SS
         pts = [(int(bc + rx * s2), int(bc + ry * s2)) for rx, ry in _arrow_raw_points(direction)]
-        jr = max(2, size // 12) * SS
-        grow = 1.0 + 4.6 / size
-        cxm = sum(p[0] for p in pts) / len(pts)
-        cym = sum(p[1] for p in pts) / len(pts)
-        spts = [(int(cxm + (p[0] - cxm) * grow), int(cym + (p[1] - cym) * grow)) for p in pts]
 
-        # 描边层（放大）→ 金属身体层
-        _rounded_poly(big, spts, outline, jr)
-        _rounded_poly(big, pts, color, jr)
-
-        # 两层高光（柔光大斑 + 小亮斑，金属质感）
-        hx_raw, hy_raw = -0.38, -0.24
-        if direction == DIR_RIGHT:
-            hx, hy = hx_raw, hy_raw
-        elif direction == DIR_LEFT:
-            hx, hy = -hx_raw, hy_raw
-        elif direction == DIR_UP:
-            hx, hy = hy_raw, -hx_raw
-        else:
-            hx, hy = -hy_raw, hx_raw
-        hcx, hcy = int(bc + hx * s2), int(bc + hy * s2)
-        soft = tuple(int(c + (255 - c) * 0.45) for c in color)
-        bright = tuple(int(c + (255 - c) * 0.85) for c in color)
-        pygame.draw.circle(big, soft, (hcx, hcy), max(2, size // 5 * SS))
-        pygame.draw.circle(big, bright, (hcx - int(s2 * 0.05), hcy - int(s2 * 0.06)),
-                           max(2, size // 11 * SS))
+        # 身体层 + 沿边描边（描边不超出顶点，尖端保持干净）
+        pygame.draw.polygon(big, color, pts)
+        pygame.draw.polygon(big, outline, pts, 2 * SS)
 
         img = pygame.transform.smoothscale(big, (box1, box1))
         if a_key < 255:
@@ -203,6 +174,15 @@ class Arrow:
 
         center_x = board_x + self.col * CELL_SIZE + CELL_SIZE // 2
         center_y = board_y + self.row * CELL_SIZE + CELL_SIZE // 2
+        # 与参考图一致：箭头位置向所指方向前移（纵向 8、横向 4）
+        if self.direction == DIR_RIGHT:
+            center_x += 4
+        elif self.direction == DIR_LEFT:
+            center_x -= 4
+        elif self.direction == DIR_UP:
+            center_y -= 8
+        elif self.direction == DIR_DOWN:
+            center_y += 8
         center_x += self.fly_offset_x + self.bounce_offset_x
         center_y += self.fly_offset_y + self.bounce_offset_y
 
@@ -211,7 +191,7 @@ class Arrow:
         # 提示高亮：脉动金色光环（先画，让箭头身体压住重叠部分）
         if self.hint_timer > 0 and self.alive:
             pulse = 0.5 + 0.5 * math.sin(self.hint_timer * 11)
-            rr = int(ARROW_SIZE * 0.72 + 4 * pulse)
+            rr = int(ARROW_SIZE * 1.05 + 4 * pulse)
             box = rr * 2 + 12
             glow = pygame.Surface((box, box), pygame.SRCALPHA)
             cc = box // 2
@@ -223,8 +203,9 @@ class Arrow:
         self._render(surface, center_x, center_y, color, self.alpha, getattr(self, 'scale', 1.0))
 
     def _render(self, surface, cx, cy, color, alpha=255, scale=1.0):
-        """直接走超采样渲染（表面内部缓存）"""
-        size = max(8, int((ARROW_SIZE // 2) * scale))
+        """直接走超采样渲染：纵向箭头略大于横向（与参考图一致）"""
+        base_size = 21 if self.direction in (DIR_UP, DIR_DOWN) else 19
+        size = max(8, int(base_size * scale))
         draw_rounded_arrow(surface, cx, cy, size, color, self.direction, alpha=int(alpha))
 
     def contains_point(self, x, y, board_x, board_y):
